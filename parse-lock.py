@@ -41,6 +41,12 @@ class btle(object):
                             (access_addr, ADDRS[access_addr]))
         btle.ADDRS[access_addr] = btle.STATE_CONNECTED
 
+    @staticmethod
+    def is_connected(access_addr):
+        if access_addr in btle.ADDRS:
+            return btle.ADDRS[access_addr] == btle.STATE_CONNECTED
+        return False
+
 class btle_adv_ind(btle):
     def __init__(self, pkt):
         super(btle_adv_ind, self).__init__(pkt)
@@ -50,16 +56,21 @@ class btle_adv_ind(btle):
 
 
 class btle_conn_req(btle):
+    FMT = '<6s6sL3sBHHHH5sB'
     def __init__(self, pkt):
         super(btle_conn_req, self).__init__(pkt)
 
         # specify that this access addr is now a connection
-        btle.conn_req(self.access_addr)
 
         self.length     = (self.data_header >> 8) & 0x3f
 
-        self.init_addr  = pkt[11:5:-1]
-        self.adv_addr   = pkt[17:12:-1]
+        # ugh hack hack
+        self.init_addr, self.adv_addr, self.access_addr, self.crc_init, \
+        self.win_size, self.win_offset, self.interval, self.latency, self.timeout, \
+        self.chan_map, self.hopclock, = \
+            struct.unpack(btle_conn_req.FMT, pkt[6:6+struct.calcsize(btle_conn_req.FMT)])
+
+        btle.conn_req(self.access_addr)
 
 
 class btle_data(btle):
@@ -75,8 +86,6 @@ class btle_data(btle):
         self.data = pkt[6:self.length+6]
 
 
-    pass
-
 def btle_factory(pkt):
     access_addr, data_header = struct.unpack(btle.FMT, pkt[:struct.calcsize(btle.FMT)])
     if access_addr == 0x8e89bed6:
@@ -91,7 +100,7 @@ def btle_factory(pkt):
             # generic
             return btle(pkt)
 
-    elif access_addr in btle.ADDRS and btle.ADDRS[access_addr] == btle.STATE_CONNECTED:
+    elif btle.is_connected(access_addr):
         return btle_data(pkt)
 
     else:
@@ -101,6 +110,91 @@ def btle_factory(pkt):
 def mac(addr):
     return ':'.join(['%02x' % ord(x) for x in addr])
 
+
+
+class l2cap(object):
+    FMT = '<HH'
+    def __init__(self, pkt):
+        fmt_len = struct.calcsize(l2cap.FMT)
+
+        self.length, self.cid, = struct.unpack(l2cap.FMT, pkt[:fmt_len])
+
+        self.data = pkt[fmt_len:fmt_len+self.length]
+
+# bluetooth attribute protocol
+class btatt(object):
+    FMT = '<B'
+    HANDLE_FMT = '<H'
+
+    OP_ERROR_RESP               = 0x01
+    OP_FIND_BY_TYPE_VAL_REQ     = 0x06
+    OP_FIND_BY_TYPE_VAL_RESP    = 0x07
+    OP_READ_BY_TYPE_REQ         = 0x08
+    OP_READ_BY_TYPE_RESP        = 0x09
+    OP_READ_REQ                 = 0x0a
+    OP_READ_RESP                = 0x0b
+    OP_READ_BLOB_REQ            = 0x0c
+    OP_READ_BLOB_RESP           = 0x0d
+    OP_WRITE_REQ                = 0x12
+    OP_WRITE_RESP               = 0x13
+
+    def __init__(self, pkt):
+        fmt_len = struct.calcsize(btatt.FMT)
+        self.opcode, = struct.unpack(btatt.FMT, pkt[:fmt_len])
+
+        self.str = 'UNKNOWN'
+
+        if self.opcode == btatt.OP_ERROR_RESP:
+            self.str = 'ERROR'
+
+        elif self.opcode == btatt.OP_FIND_BY_TYPE_VAL_REQ:
+            self.start_handle, self.end_handle, = \
+                struct.unpack('<HH', pkt[fmt_len:fmt_len+4])
+            self.str = 'FIND_BY_TYPE_VAL_REQ 0x%04x - 0x%04x' % (self.start_handle, self.end_handle)
+
+        elif self.opcode == btatt.OP_FIND_BY_TYPE_VAL_RESP:
+            self.start_handle, self.end_handle, = \
+                struct.unpack('<HH', pkt[fmt_len:fmt_len+4])
+            self.str = 'FIND_BY_TYPE_VAL_RESP 0x%04x - 0x%04x' % (self.start_handle, self.end_handle)
+
+        elif self.opcode == btatt.OP_READ_BY_TYPE_REQ:
+            self.start_handle, self.end_handle, = \
+                struct.unpack('<HH', pkt[fmt_len:fmt_len+4])
+            self.str = 'READ_BY_TYPE_REQ 0x%04x - 0x%04x' % (self.start_handle, self.end_handle)
+
+        elif self.opcode == btatt.OP_READ_BY_TYPE_RESP:
+            pass
+            self.str = 'READ_BY_TYPE_RESP'
+
+        elif self.opcode == btatt.OP_READ_REQ:
+            self.handle, = struct.unpack(btatt.HANDLE_FMT, pkt[fmt_len:fmt_len+2])
+            self.str = 'READ_REQ(0x%04x)' % self.handle
+
+        elif self.opcode == btatt.OP_READ_RESP:
+            self.data = pkt[fmt_len:]
+            self.str = 'READ_RESP(%d bytes): %s' % (len(self.data), self.data.encode('hex'))
+
+        elif self.opcode == btatt.OP_READ_BLOB_REQ:
+            self.handle, self.offset, = struct.unpack('<HH', pkt[fmt_len:fmt_len+4])
+            self.str = 'READ_BLOB_REQ(0x%04x, %d)' % (self.handle, self.offset)
+
+        elif self.opcode == btatt.OP_READ_BLOB_RESP:
+            self.data = pkt[fmt_len:]
+            self.str = 'READ_BLOB_RESP(%d bytes): %s' % (len(self.data), self.data.encode('hex'))
+
+        elif self.opcode == btatt.OP_WRITE_REQ:
+            self.handle, = struct.unpack(btatt.HANDLE_FMT, pkt[fmt_len:fmt_len+2])
+            self.data = pkt[fmt_len+2:]
+            self.str = 'WRITE_REQ(0x%04x, %s) (%d bytes)' % (self.handle, self.data.encode('hex'), len(self.data))
+
+        elif self.opcode == btatt.OP_WRITE_RESP:
+            self.str = 'WRITE_RESP'
+
+
+    def __str__(self):
+        return self.str
+
+# TODO move to main, or the rest of the stuff out of this file
 for ts, pkt in dpkt.pcap.Reader(open(sys.argv[1], 'r')):
     ppi_pkt = ppi(pkt)
 
@@ -108,3 +202,15 @@ for ts, pkt in dpkt.pcap.Reader(open(sys.argv[1], 'r')):
 
     if btle_pkt.__class__ is btle_conn_req:
         print 'CONN_REQ %s -> %s' % (mac(btle_pkt.init_addr), mac(btle_pkt.adv_addr))
+
+    elif btle_pkt.__class__ is btle_data:
+        if btle_pkt.llid == 2: # L2CAP message or frag
+            if len(btle_pkt.data) != 0:
+                l2_pkt = l2cap(btle_pkt.data)
+                bt_pdu = btatt(l2_pkt.data)
+
+                print '%s' % (bt_pdu)
+        elif btle_pkt.llid == 3: # Control PDU
+            print 'CONN_TERM: %s' % (btle_pkt.data.encode('hex'))
+
+
